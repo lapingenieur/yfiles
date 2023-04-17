@@ -35,6 +35,7 @@ enum PasswordMode {
 	entry
 	ask
 	empty
+	command
 }
 type PasswordString = string
 fn (self PasswordString) str() string {
@@ -47,6 +48,7 @@ struct AddressData {
 pub mut:
 	address string
 	password PasswordString
+	password_command string
 	password_mode PasswordMode
 	ports []u64 = []u64{cap: 5}
 }
@@ -59,6 +61,7 @@ struct ConfigData {
 pub mut:
 	addresses map[string]AddressData = map[string]AddressData
 	run_addresses []string
+	commands map[string]string
 	proceed bool = true
 	log Log
 }
@@ -115,7 +118,7 @@ fn (self Log) debug(orig string, msg string) {
 //// End of Log
 
 fn help() {
-	println("sshtpt - SSH TCP-Port Tunnel (v1.0)
+	println("sshtpt - SSH TCP-Port Tunnel (v1.2)
 
 usage:
   tunnel [ARG...]
@@ -133,9 +136,9 @@ tunneling arguments:
   --add PROFILE...
 	specify profiles found in the configuration to use for tunneling (see configuration)
   --use CONFIG...
-	specify config files that live in the configuration directory to read and include
-	user can indicate profiles in different config files and load them lazily,
-	so sshtpt doesn't spend too much time reading the main configuration
+	specify config files to read and include
+	user can define profiles in different config files and load them lazily,
+	so sshtpt doesn't spend too much time reading the main configuration file
 the following arguments need to be preceeded by an occurence of -a HOSTNAME
 this HOSTNAME is below referenced to as the 'current profile'
 note that very similar instructions exist for sshtpt config files, see configuration
@@ -172,15 +175,15 @@ configuration:
   indicates in the CLI arguments or with the include-config instructions
 
 config file syntax:
-  a man-like description would be: ( INS [: ARG...] ; )...
-  - a declaration consists of an instruction (INS) with or without arguments (ARG...)
-  - instructions are separated from their potential arguments by a colon (:)
-  - a declaration must end with a semi colon (;), it is placed right after the instruction if there's no argument
+  a man-like description would be: ( DIR [: ARG...] ; )...
+  - an instruction consists of a directive (DIR) with or without arguments (ARG...)
+  - directives are separated from their potential arguments by a colon (:)
+  - an instruction must end with a semi colon (;), it is placed right after the directive if there's no argument
   - the arguments are separated by any of the space-like character (space, \\n, \\t, \\v, \\f and \\r)
   - one argument shall not contain any space-like character
-  - a declaration can span several lines as long as they respect the upper needs
+  - an instruction can span several lines as long as it respects the upper described needs
   !! be aware that sshtpt will return an error if one of the specified config files contain errors
-list of config declarations:
+list of config directives:
   address,
   profile: ADDRESS [ARG [PARAM]...]...
     define a new address profile with address ADDRESS (name will be set to ADDRESS as well)
@@ -190,8 +193,11 @@ list of config declarations:
       name NAME
         set the profile name to NAME
     plus all the CLI arguments explained below the 'preceeded by -a' section, without the double dash prefixes
-  include: FILE
-    also read the file FILE, located in either directory explained under the 'configuration' section")
+  use,
+  include: FILE...
+	like the --use CLI argument: specify config files to read and include *after* having read the current file
+  add: PROFILE...
+	like the --add CLI argument; you shouldn't use this in main.conf")
 }
 
 //// ArgDecodeModes used as buffer
@@ -199,6 +205,7 @@ enum ArgDecodeModes {
 	zero
 	ports
 	use
+	add
 }
 
 fn get_args(mut config &ConfigData) !ConfigData {
@@ -234,8 +241,28 @@ fn get_args(mut config &ConfigData) !ConfigData {
 				config.run_addresses << address
 				mode = .ports
 			}
-			"--add" {
+			"--use" {
 				mode = .use
+			}
+			"--add" {
+				mode = .add
+			}
+			"--command" {
+				name := args.next() or {
+					config.log.error("args", "missing parameter #1 (name) for argument $args.idx '$arg'")
+					return error("")
+				}
+				config.commands[name] = args.next() or {
+					config.log.error("args", "missing parameter #2 (command) for argument $args.idx '$arg'")
+					return error("")
+				}
+			}
+			"--password-cmd", "--password-command" {
+				config.addresses[address].password_command = args.next() or {
+					config.log.error("args", "missing parameter for argument $args.idx '$arg'")
+					return error("")
+				}
+				config.addresses[address].password_mode = .command
 			}
 			"--password" {
 				param := args.next() or {
@@ -313,8 +340,12 @@ fn get_args(mut config &ConfigData) !ConfigData {
 
 						config.addresses[address].add_port(port)
 					}
-					.use {
+					.add {
 						config.run_addresses << arg
+					}
+					.use {
+						config.log.info("args", "reading $arg configuration file now")
+						get_config(mut &config, arg) or { return err }
 					}
 					.zero {
 							config.log.error("args", "unknown argument '${arg}'")
@@ -328,7 +359,9 @@ fn get_args(mut config &ConfigData) !ConfigData {
 	return config
 }
 
-fn get_config(mut config &ConfigData) !ConfigData {
+fn get_config(mut config &ConfigData, filename string) !ConfigData {
+	config.log.debug("config", "parsing config for '$filename'")
+
 	config_xdg := os.config_dir() or {
 		config.log.error("config", "unable to find the global configuration directory")
 		return error("")
@@ -338,30 +371,80 @@ fn get_config(mut config &ConfigData) !ConfigData {
 		config.log.error("config", "unable to find the sshtpt configuration directory (${config_dir})")
 		return error("")
 	}
-	config_main := os.join_path_single(config_dir, "main.conf")
-	if ! os.is_file(config_main) {
-		config.log.error("config", "unable to find the main configuration file (${config_main})")
-		return error("")
+	mut config_path := os.join_path_single(config_dir, filename + ".conf")
+	if ! os.is_file(config_path) {
+		config_path = os.join_path_single(config_dir, filename)
+		if ! os.is_file(config_path) {
+			config_path = filename
+			if ! os.is_file(config_path) {
+				config.log.error("config", "unable to find `$filename` configuration file")
+				return error("")
+			}
+		}
 	}
 
-	config_instructions := (os.read_file(config_main) or {
-		config.log.error("config", "unable to read the main config file")
+	config_instructions := (os.read_file(config_path) or {
+		config.log.error("config", "unable to read `$config_path` configuration file")
 		return error("")
 	}).split(";")
+
+	mut include_files := []string{} // inluded files are read after finished reading the current file
+
 	for i, instruction in config_instructions {
 		if instruction.contains(":") {
 			mut directive, mut value := instruction.split_once(":")
 			directive = directive.trim_space()
 			value = value.trim_space()
 
+			mut args := ParseArgsSt {
+				array: value.split_any(" \t\v\f\r\n")
+				idx: 0
+			}
+
 			match directive {
 				"" { continue }
-				"address", "profile" {
-					mut args := ParseArgsSt {
-						array: value.split_any(" \t\v\f\r\n")
-						idx: 1
+				"add" {
+					config.run_addresses << args.next() or {
+						config.log.error("args", "missing argument for $directive directive at instruction $i of '$filename' configuration file")
+						return error("")
 					}
-					mut name := args.array[0]
+					for {
+						config.run_addresses << args.next() or { break }
+					}
+				}
+				"use", "include" {
+					if filename == "main.conf" {
+						config.log.warn("config", "you shouldn't include other configuration files from your main.conf configuration; prefer the CLI '--use CONFIG' argument")
+					}
+					mut param := args.next() or {
+						config.log.error("config", "missing argument for $directive directive at instruction $i of '$filename' configuration file")
+						return error("")
+					}
+					include_files << param
+					config.log.info("config", "defered reading ${param} configuration file")
+					for {
+						param = args.next() or { break }
+						include_files << param
+						config.log.info("config", "defered reading ${param} configuration file")
+					}
+				}
+				"command" {
+					name := args.next() or {
+						config.log.error("config", "missing argument #1 (name) for $directive directive at instruction $i of '$filename' configuration file")
+						return error("")
+					}
+					if args.array.len < args.idx {
+						config.log.error("config", "missing arguments for $directive directive at instruction $i of '$filename' configuration file")
+						return error("")
+					}
+
+					config.commands[name] = value.trim_string_left(name).trim_space()
+				}
+				"address", "profile" {
+					mut name := args.next() or {
+						config.log.error("config", "missing arguments for $directive directive at instruction $i of '$filename' configuration file")
+						return error("")
+					}
 					mut address_template := AddressData { address: name }
 
 					mut mode_port := false
@@ -374,13 +457,13 @@ fn get_config(mut config &ConfigData) !ConfigData {
 							"ports", "port" { mode_port = true }
 							"name" {
 								name = args.next() or {
-									config.log.error("args", "missing name arguments at instruction ${i} '${instruction}' of main.conf")
+									config.log.error("config", "missing arguments for name at instruction ${i} of '$filename' configuration file")
 									return error("")
 								}
 							}
 							"password-location" {
 								mut location := args.next() or {
-									config.log.error("args", "missing password-location argument at instruction ${i} '${instruction}' of main.conf")
+									config.log.error("config", "missing arguments for password-location at instruction ${i} of '$filename' configuration file")
 									return error("")
 								}
 
@@ -390,27 +473,27 @@ fn get_config(mut config &ConfigData) !ConfigData {
 									location = os.join_path(config_dir, location)
 									config.log.warn("config", "password files shouldn't stay in the configuration directory for security reasons")
 								} else if ! os.is_file(location) {
-									config.log.error("config", "unexisting file '${location}' specified by password-location at instruction ${i} of main.conf")
+									config.log.error("config", "unexisting file '${location}' specified by password-location at instruction ${i} of '$filename' configuration file")
 									return error("")
 								}
 
 								password := (os.read_file(location) or {
-									config.log.error("config", "failed reading from password-location file '${location}' at instruction ${i} of main.conf: ${err}")
+									config.log.error("config", "failed reading from password-location file '${location}' at instruction ${i} of '$filename' configuration file:\n   ${err}")
 									return error("")
 								}).trim("\n")
 								if password.count("\n") != 0 {
-									config.log.error("config", "password in file ${location} must be single-instruction at instruction ${i} of main.conf")
+									config.log.error("config", "password in file ${location} must be single-line at instruction ${i} of '$filename' configuration file")
 									return error("")
 								}
 								address_template.password = password
 							}
 							"password-env", "env-password" {
 								param := args.next() or {
-									config.log.error("config", "missing password-env argument at instruction ${i} of main.conf")
+									config.log.error("config", "missing argument for password-env at instruction ${i} of '$filename' configuration file")
 									return error("")
 								}
 								password := os.getenv_opt(param) or {
-									config.log.error("config", "the environment variable '${name}' specified for password-env is currently undeclared at instruction ${i} of main.conf")
+									config.log.error("config", "the environment variable '${name}' specified for password-env is currently undeclared at instruction ${i} of '$filename' configuration file")
 									return error("")
 								}
 								address_template.password = password
@@ -421,22 +504,30 @@ fn get_config(mut config &ConfigData) !ConfigData {
 							"password-ask", "ask-password" {
 								address_template.password_mode = .ask
 							}
+							"password-cmd", "password-command" {
+								address_template.password_command = args.next() or {
+									config.log.error("config", "missing $directive argument at instruction ${i} '${instruction}' of main.conf")
+									return error("")
+								}
+								address_template.password_mode = .command
+							}
 							"password" {
 								address_template.password = args.next() or {
 									config.log.error("config", "missing password argument at instruction ${i} '${instruction}' of main.conf")
 									return error("")
 								}
+								address_template.password_mode = .entry
 							}
 							else {
 								if port := arg.parse_uint(10, 64) {
 									if mode_port {
 										address_template.add_port(port)
 									} else {
-										config.log.error("config", "expected argument 'ports' before any ports specified at instruction ${i} of main.conf")
+										config.log.error("config", "expected argument 'ports' before any ports specified at instruction ${i} of '$filename' configuration file")
 										return error("")
 									}
 								} else {
-									config.log.error("config", "unknown argument '${arg}' at instruction ${i} of main.conf")
+									config.log.error("config", "unknown argument '${arg}' at instruction ${i} of '$filename' configuration file")
 									return error("")
 								}
 							}
@@ -446,11 +537,15 @@ fn get_config(mut config &ConfigData) !ConfigData {
 					config.addresses[name] = address_template
 				}
 				else {
-					config.log.error("config", "unknown config directive '${directive}' at instruction ${i} of main.conf")
+					config.log.error("config", "unknown config directive '${directive}' at instruction ${i} of '$filename' configuration file")
 					return error("")
 				}
 			}
 		}
+	}
+
+	for include in include_files {
+		config = get_config(mut &config, include) or { return err }
 	}
 
 	return config
@@ -502,7 +597,7 @@ fn spawnvpec(name string, args []string, envs []string, log Log) int {
 			if C.waitpid(child, &wstatus, C.WNOHANG) == child {
 				if C.WIFEXITED(wstatus) {
 					status = C.WEXITSTATUS(wstatus)
-					log.debug("exec", "child returned with status $status")
+					log.debug("exec", "child returned with status ${status}_u8")
 				} else {
 					log.warn("exec", "child was returned but didn't call _exit on its own!")
 				}
@@ -586,7 +681,7 @@ fn input_hidden(prompt string) !string {
 	return os.input_opt(prompt) or { "" }
 }
 
-fn proceed(config &ConfigData) ! {
+fn proceed(config &ConfigData) !int {
 	config.log.debug("proceed", "checking whether ssh and sshpass are callable commands")
 	{
 		mut deps := []string{cap: 2}
@@ -610,11 +705,19 @@ fn proceed(config &ConfigData) ! {
 		}
 	}
 
+	mut error_count := 0
+
 	for i, name in config.run_addresses {
 		config.log.debug("proceed", "proceeding profile #$i '$name'")
 
 		if name !in config.addresses {
 			config.log.error("proceed", "$name is not a configured address profile")
+			error_count++
+			config.log.debug("proceed", "continuing with the next profile")
+			continue
+		}
+		if config.addresses[name].ports.len == 0 {
+			config.log.info("proceed", "no port specified for profile $name")
 			config.log.debug("proceed", "continuing with the next profile")
 			continue
 		}
@@ -628,9 +731,31 @@ fn proceed(config &ConfigData) ! {
 			config.log.debug("proceed", "empty password for profile '$name'")
 		} else if profile.password_mode == .entry && profile.password != "" {
 			password = profile.password
+		} else if profile.password_mode == .command {
+			if profile.password_command in config.commands {
+				config.log.debug("proceed", "using command internally name '${config.commands[profile.password_command]}")
+				result := os.execute(config.commands[profile.password_command])
+				if result.exit_code != 0 {
+					config.log.error("proceed", "extern password command internally named '${profile.password_command}' exited with status $result.exit_code: '${config.commands[profile.password_command]}_u8'")
+					config.log.debug("proceed", "continuing with the next profile")
+					error_count++
+					continue
+				}
+				password = result.output
+			} else {
+				result := os.execute(profile.password_command)
+				if result.exit_code != 0 {
+					config.log.error("proceed", "extern password command '$profile.password_command' exited with status ${result.exit_code}_u8")
+					config.log.debug("proceed", "continuing with the next profile")
+					error_count++
+					continue
+				}
+				password = result.output
+			}
 		} else {
 			password = input_hidden("Password for profile '$name': ") or {
 				config.log.error("proceed", "failed reading password for profile #$i '$name'")
+				error_count++
 				config.log.debug("proceed", "continuing with the next profile")
 				continue
 			}
@@ -651,6 +776,7 @@ fn proceed(config &ConfigData) ! {
 			status := spawnvpec("sshpass", args, plusenv, config.log)
 			if status != 0 {
 				config.log.error("proceed", "failed tunnel creation for port #$l $port of profile #$i '$name' with status $status")
+				error_count++
 				config.log.debug("proceed", "continuing the following operations")
 				continue
 			}
@@ -658,6 +784,8 @@ fn proceed(config &ConfigData) ! {
 			config.log.debug("proceed", "proceeded port #$l $port of profile #$i '$name' successfully")
 		}
 	}
+
+	return error_count
 }
 
 fn main() {
@@ -674,21 +802,21 @@ fn main() {
 		config.log.level = .silent
 	}
 
-	config.log.debug("main", "starting decoding config")
-	config = get_config(mut &config) or {
+	config.log.debug("main", "starting decoding main config")
+	config = get_config(mut &config, "main.conf") or {
 		config.log.debug("main", "config returned an error; aborting")
 		return
 	}
-	config.log.debug("main", "decoding config ended")
+	config.log.debug("main", "ended decoding main config")
 
 	config.log.debug("main", "starting decoding arguments")
 	config = get_args(mut &config) or {
 		config.log.debug("main", "args returned an error; aborting")
 		return
 	}
-	config.log.debug("main", "decoding arguments ended")
+	config.log.debug("main", "ended decoding arguments")
 
-	config.log.debug("main", "logging loaded config: $config")
+	config.log.debug("main", "logging currently loaded config: $config")
 
 	if config.proceed {
 		if config.run_addresses.len == 0 {
@@ -697,13 +825,19 @@ fn main() {
 		}
 
 		config.log.debug("main", "starting proceeding")
-		proceed(&config) or {
+		error_count := proceed(&config) or {
 			config.log.debug("main", "proceed returned an error")
+			-1
 		}
-		config.log.debug("main", "proceeding ended")
-		config.log.info("main", "everything went fine!")
+		config.log.debug("main", "ended proceeding")
+
+		if error_count > 0 {
+			config.log.warn("main", "$error_count errors occured during execution, some tunnels may be set")
+		} else {
+			config.log.info("main", "everything went fine!")
+		}
 	} else {
-		config.log.debug("main", "got no proceed, exiting now...")
+		config.log.debug("main", "found 'no proceed' in config, exiting now...")
 	}
 
 	config.log.debug("main", "main ended")
